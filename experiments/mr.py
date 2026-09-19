@@ -4,6 +4,7 @@
 我第二次 READ 有没有倒退？
 
 READ → READ
+现在让第一次从Primary 读、第二次从 Secondary 读，让第二次 READ 真正有机会“倒退”
 """
 import sys
 
@@ -19,22 +20,23 @@ from common import create_client, get_collection
 
 def run_one_trial(
     setup_collection,
-    experiment_collection,
+    update_collection,
+    primary_read_collection,
+    secondary_read_collection,
     config_name,
     trial_id
 ):
     """
     Run one Monotonic-Reads (MR) trial.
 
-    Setup phase:
-        Prepare a stable initial state: version = 1.
+    Setup:
+        Prepare version = 1.
 
-    Experiment phase:
-        1. Perform the first READ.
-        2. Write a newer version = 2.
-        3. Perform the second READ.
-        4. Check whether the second read returns the same
-           or a newer version than the first read.
+    Experiment:
+        1. Update the document to version = 2.
+        2. READ 1 from the Primary.
+        3. READ 2 from a Secondary.
+        4. Check whether READ 2 is at least as new as READ 1.
 
     Returns:
         "PASS"
@@ -42,9 +44,6 @@ def run_one_trial(
         "FAILED"
     """
 
-    # Each trial uses a different document.
-    # This prevents different trials/configurations
-    # from interfering with each other.
     document_id = f"mr_{config_name}_{trial_id}"
 
     try:
@@ -52,8 +51,6 @@ def run_one_trial(
         # ====================================================
         # SETUP PHASE
         # ====================================================
-        # Prepare a stable baseline.
-        # This operation is NOT part of the MR experiment.
 
         setup_collection.update_one(
             {"_id": document_id},
@@ -69,24 +66,11 @@ def run_one_trial(
         # EXPERIMENT PHASE
         # ====================================================
 
-        # -------------------------
-        # FIRST READ
-        # -------------------------
-
-        first_result = experiment_collection.find_one(
-            {"_id": document_id}
-        )
-
-        if first_result is None:
-            return "FAILED"
-
-        first_version = first_result["version"]
-
-        # -------------------------
+        # ----------------------------------------------------
         # Create a newer version
-        # -------------------------
+        # ----------------------------------------------------
 
-        experiment_collection.update_one(
+        update_collection.update_one(
             {"_id": document_id},
             {
                 "$set": {
@@ -95,11 +79,26 @@ def run_one_trial(
             }
         )
 
-        # -------------------------
-        # SECOND READ
-        # -------------------------
+        # ----------------------------------------------------
+        # FIRST READ
+        # ----------------------------------------------------
+        # Read from Primary.
 
-        second_result = experiment_collection.find_one(
+        first_result = primary_read_collection.find_one(
+            {"_id": document_id}
+        )
+
+        if first_result is None:
+            return "FAILED"
+
+        first_version = first_result["version"]
+
+        # ----------------------------------------------------
+        # SECOND READ
+        # ----------------------------------------------------
+        # Read from Secondary.
+
+        second_result = secondary_read_collection.find_one(
             {"_id": document_id}
         )
 
@@ -108,9 +107,9 @@ def run_one_trial(
 
         second_version = second_result["version"]
 
-        # -------------------------
-        # Check MR
-        # -------------------------
+        # ----------------------------------------------------
+        # Check Monotonic Reads
+        # ----------------------------------------------------
 
         if second_version >= first_version:
             return "PASS"
@@ -131,7 +130,10 @@ def run_one_trial(
 # Run complete MR experiment
 # ============================================================
 
-def run_experiment(config_name, num_trials):
+def run_experiment(
+    config_name,
+    num_trials
+):
 
     client = create_client()
 
@@ -142,10 +144,8 @@ def run_experiment(config_name, num_trials):
     try:
 
         # ====================================================
-        # SETUP COLLECTION
+        # Stable setup
         # ====================================================
-        # Use a fixed, reliable configuration to prepare
-        # the initial state before each trial.
 
         setup_collection = (
             client["consistency_test"]
@@ -157,25 +157,50 @@ def run_experiment(config_name, num_trials):
         )
 
         # ====================================================
-        # EXPERIMENT COLLECTION
+        # Update collection
         # ====================================================
-        # This collection uses the actual configuration
-        # being tested: C1 / C2 / C3 / C4.
+        # Uses the tested C1/C2/C3/C4 configuration.
 
-        experiment_collection = get_collection(
+        update_collection = get_collection(
             client,
-            config_name
+            config_name,
+            read_from="primary"
+        )
+
+        # ====================================================
+        # First READ -> Primary
+        # ====================================================
+
+        primary_read_collection = get_collection(
+            client,
+            config_name,
+            read_from="primary"
+        )
+
+        # ====================================================
+        # Second READ -> Secondary
+        # ====================================================
+
+        secondary_read_collection = get_collection(
+            client,
+            config_name,
+            read_from="secondary"
         )
 
         # ====================================================
         # Run N trials
         # ====================================================
 
-        for trial_id in range(1, num_trials + 1):
+        for trial_id in range(
+            1,
+            num_trials + 1
+        ):
 
             result = run_one_trial(
                 setup_collection,
-                experiment_collection,
+                update_collection,
+                primary_read_collection,
+                secondary_read_collection,
                 config_name,
                 trial_id
             )
@@ -190,6 +215,7 @@ def run_experiment(config_name, num_trials):
                 failed_count += 1
 
     finally:
+
         client.close()
 
     # ========================================================
@@ -199,7 +225,8 @@ def run_experiment(config_name, num_trials):
     total_trials = num_trials
 
     completed_trials = (
-        pass_count + violation_count
+        pass_count
+        + violation_count
     )
 
     if completed_trials > 0:
@@ -211,6 +238,7 @@ def run_experiment(config_name, num_trials):
         )
 
     else:
+
         violation_rate = 0.0
 
     failure_rate = (
@@ -223,14 +251,38 @@ def run_experiment(config_name, num_trials):
     # Print results
     # ========================================================
 
-    print("\n========== MR RESULTS ==========")
+    print(
+        "\n========== MR RESULTS =========="
+    )
 
-    print(f"Configuration:      {config_name}")
-    print(f"Total trials:       {total_trials}")
-    print(f"Completed trials:   {completed_trials}")
-    print(f"Passes:             {pass_count}")
-    print(f"Violations:         {violation_count}")
-    print(f"Failed trials:      {failed_count}")
+    print(
+        f"Configuration:      {config_name}"
+    )
+
+    print(
+        "Read path:          "
+        "Primary READ -> Secondary READ"
+    )
+
+    print(
+        f"Total trials:       {total_trials}"
+    )
+
+    print(
+        f"Completed trials:   {completed_trials}"
+    )
+
+    print(
+        f"Passes:             {pass_count}"
+    )
+
+    print(
+        f"Violations:         {violation_count}"
+    )
+
+    print(
+        f"Failed trials:      {failed_count}"
+    )
 
     print(
         f"Violation rate:     "
@@ -242,7 +294,9 @@ def run_experiment(config_name, num_trials):
         f"{failure_rate:.2f}%"
     )
 
-    print("================================")
+    print(
+        "================================"
+    )
 
 
 # ============================================================
@@ -255,7 +309,8 @@ if __name__ == "__main__":
 
         print(
             "Usage: "
-            "python mr.py <C1|C2|C3|C4> "
+            "python mr.py "
+            "<C1|C2|C3|C4> "
             "<num_trials>"
         )
 
@@ -263,7 +318,9 @@ if __name__ == "__main__":
 
     config_name = sys.argv[1].upper()
 
-    num_trials = int(sys.argv[2])
+    num_trials = int(
+        sys.argv[2]
+    )
 
     run_experiment(
         config_name,
