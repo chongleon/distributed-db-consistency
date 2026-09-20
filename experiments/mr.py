@@ -1,11 +1,217 @@
 """
-我第一次 READ 看到了什么
-        ↓
-我第二次 READ 有没有倒退？
+MR（Monotonic Reads，单调读）实验
+我们大部分pass的原因可能是因为 设置的节点数量比较少，在同台机器的docker容器里跑mongoDB 节点之间的通讯很快
+很少出现secondary没有同步更新的情况
+一、MR 在验证什么？
 
-READ → READ
-现在让第一次从Primary 读、第二次从 Secondary 读，让第二次 READ 真正有机会“倒退”
+    核心问题：
+
+    我第一次 READ 看到了什么，
+    我第二次 READ 会不会反而看到更旧的数据？
+
+    操作顺序：
+
+        READ 1 -> READ 2
+
+    Monotonic Reads 要求：
+
+    同一个 Client 第一次读取某个数据之后，
+    后续再次读取这个数据时，
+    只能看到相同或者更新的版本，
+    不能看到比第一次 READ 更旧的版本。
+
+
+二、实验设计思路
+
+    每一次 trial：
+
+    1. 使用稳定配置初始化：
+
+           version = 1
+
+    2. 将数据更新为：
+
+           version = 2
+
+    3. 开启一个 MongoDB causally consistent session。
+
+    4. 在该 session 中进行第一次 READ：
+
+           READ 1 -> Primary
+
+       Primary 更有机会读到最新的 version = 2。
+
+    5. 在同一个 session 中进行第二次 READ：
+
+           READ 2 -> Secondary
+
+       Secondary 可能因为复制延迟而比 Primary 落后。
+
+    6. 比较：
+
+           second_version >= first_version
+               -> PASS
+
+           second_version < first_version
+               -> VIOLATION
+
+           操作无法完成
+               -> FAILED
+
+
+    我们故意设计：
+
+        Primary READ -> Secondary READ
+
+    就是为了让第二次 READ 有机会访问一个比第一次 READ
+    更落后的 replica，从而测试 Monotonic Reads。
+
+
+三、输出指标
+
+    - Total trials
+    - Completed trials
+    - Passes
+    - Violations
+    - Failed trials
+    - Violation rate
+    - Failure rate
+
+
+四、四种配置及 MongoDB 官方预测
+
+C1:
+    readConcern  = local
+    writeConcern = w:1
+
+    两次 READ 使用 local。
+
+    第一次从 Primary 读到比较新的数据之后，
+    第二次去 Secondary 读取时，
+    Secondary 可能还比较落后。
+
+    local 允许 Secondary 返回自己当前看到的数据，
+    因此第二次 READ 有可能比第一次 READ 更旧。
+
+    例如：
+
+        READ 1 -> version = 2
+        READ 2 -> version = 1
+
+    这样就发生了 Monotonic Reads violation。
+
+    官方预测：
+        MR NOT GUARANTEED
+
+
+C2:
+    readConcern  = majority
+    writeConcern = w:1
+
+    两次 READ 都使用 majority。
+
+    第一次 READ 已经看到某个 majority-committed 状态之后，
+    在同一个 causally consistent session 中，
+    MongoDB 会记录这个 Client 已经看到的因果位置。
+
+    第二次即使去另一个 Secondary 读取，
+    也不能直接返回一个比第一次 READ 更早的状态。
+
+    如果 Secondary 还没有追上，
+    READ 可能需要等待，而不是直接返回旧数据。
+
+    因此可以保证 Monotonic Reads。
+
+    官方预测：
+        MR GUARANTEED
+
+
+C3:
+    readConcern  = local
+    writeConcern = majority
+
+    WRITE 使用 majority，
+    所以 version = 2 的写入比较可靠。
+
+    但是 MR 真正检查的是：
+
+        READ -> READ
+
+    而这里两个 READ 仍然使用 local。
+
+    第一次从 Primary 读取之后，
+    第二次从 Secondary 读取时，
+    即使majority已经确认write了 
+    但read用的是local 
+    还是可能读到那些少数没有更新同步的secondary 
+    所以才not guaranteed
+
+    官方预测：
+        MR NOT GUARANTEED
+
+
+C4:
+    readConcern  = majority
+    writeConcern = majority
+
+    READ 使用 majority，
+    WRITE 也使用 majority。
+
+    两次 READ 又位于同一个
+    causally consistent session 中。
+
+    第一次 READ 已经看到某个状态之后，
+    MongoDB 会保证后面的 READ 不会返回
+    比第一次 READ 更早的状态。
+
+    因此可以保证 Monotonic Reads。
+
+    官方预测：
+        MR GUARANTEED
+
+
+五、最终预测总结
+
+    C1: local    + w:1
+        -> MR NOT GUARANTEED
+
+    C2: majority + w:1
+        -> MR GUARANTEED
+
+    C3: local    + majority
+        -> MR NOT GUARANTEED
+
+    C4: majority + majority
+        -> MR GUARANTEED
+
+
+六、重要说明
+
+    NOT GUARANTEED 不代表每一次实验都会出现 VIOLATION。
+
+    C1 和 C3 在正常运行时仍然可能全部 PASS，
+    例如 Secondary 同步速度很快，
+    第二次 READ 时已经追上 Primary。
+
+    GUARANTEED 也不代表故障情况下 READ 一定马上成功。
+
+    在某些情况下 MongoDB 可能等待所需要的数据状态，
+    或者操作因为节点故障、网络分区等原因无法完成。
+
+    因此实验中需要把：
+
+        VIOLATION
+        和
+        FAILED
+
+    分开统计。
+
+    本实验中的两个 READ 使用同一个
+    causally consistent session，
+    从而与 MongoDB 官方 causal consistency
+    guarantee 的实验条件保持一致。
 """
+
 import sys
 
 from pymongo.read_concern import ReadConcern
@@ -19,6 +225,7 @@ from common import create_client, get_collection
 # ============================================================
 
 def run_one_trial(
+    client,
     setup_collection,
     update_collection,
     primary_read_collection,
@@ -34,9 +241,10 @@ def run_one_trial(
 
     Experiment:
         1. Update the document to version = 2.
-        2. READ 1 from the Primary.
-        3. READ 2 from a Secondary.
-        4. Check whether READ 2 is at least as new as READ 1.
+        2. Start a causally consistent session.
+        3. READ 1 from the Primary.
+        4. READ 2 from a Secondary using the SAME session.
+        5. Check whether READ 2 is at least as new as READ 1.
 
     Returns:
         "PASS"
@@ -51,6 +259,13 @@ def run_one_trial(
         # ====================================================
         # SETUP PHASE
         # ====================================================
+        #
+        # This is not part of the MR check.
+        #
+        # Prepare a stable starting state:
+        #
+        # version = 1
+        #
 
         setup_collection.update_one(
             {"_id": document_id},
@@ -63,12 +278,15 @@ def run_one_trial(
         )
 
         # ====================================================
-        # EXPERIMENT PHASE
+        # CREATE A NEWER VERSION
         # ====================================================
-
-        # ----------------------------------------------------
-        # Create a newer version
-        # ----------------------------------------------------
+        #
+        # Uses the selected C1/C2/C3/C4 configuration.
+        #
+        # This update creates a newer state so that Primary
+        # and Secondary may temporarily observe different
+        # versions.
+        #
 
         update_collection.update_one(
             {"_id": document_id},
@@ -79,42 +297,63 @@ def run_one_trial(
             }
         )
 
-        # ----------------------------------------------------
-        # FIRST READ
-        # ----------------------------------------------------
-        # Read from Primary.
+        # ====================================================
+        # CAUSALLY CONSISTENT SESSION
+        # ====================================================
+        #
+        # Both READ operations belong to the SAME client
+        # session.
+        #
 
-        first_result = primary_read_collection.find_one(
-            {"_id": document_id}
-        )
+        with client.start_session(
+            causal_consistency=True
+        ) as session:
 
-        if first_result is None:
-            return "FAILED"
+            # ------------------------------------------------
+            # FIRST READ
+            # ------------------------------------------------
+            #
+            # Read from Primary.
+            #
 
-        first_version = first_result["version"]
+            first_result = primary_read_collection.find_one(
+                {"_id": document_id},
+                session=session
+            )
 
-        # ----------------------------------------------------
-        # SECOND READ
-        # ----------------------------------------------------
-        # Read from Secondary.
+            if first_result is None:
+                return "FAILED"
 
-        second_result = secondary_read_collection.find_one(
-            {"_id": document_id}
-        )
+            first_version = first_result["version"]
 
-        if second_result is None:
-            return "FAILED"
+            # ------------------------------------------------
+            # SECOND READ
+            # ------------------------------------------------
+            #
+            # Read from Secondary using the SAME session.
+            #
+            # This deliberately tests whether the client can
+            # move backwards to an older version.
+            #
 
-        second_version = second_result["version"]
+            second_result = secondary_read_collection.find_one(
+                {"_id": document_id},
+                session=session
+            )
 
-        # ----------------------------------------------------
-        # Check Monotonic Reads
-        # ----------------------------------------------------
+            if second_result is None:
+                return "FAILED"
 
-        if second_version >= first_version:
-            return "PASS"
+            second_version = second_result["version"]
 
-        return "VIOLATION"
+            # ------------------------------------------------
+            # Check Monotonic Reads
+            # ------------------------------------------------
+
+            if second_version >= first_version:
+                return "PASS"
+
+            return "VIOLATION"
 
     except Exception as e:
 
@@ -144,22 +383,35 @@ def run_experiment(
     try:
 
         # ====================================================
-        # Stable setup
+        # STABLE SETUP COLLECTION
         # ====================================================
+        #
+        # Fixed majority + majority.
+        #
+        # Used only to prepare version = 1.
+        #
 
         setup_collection = (
             client["consistency_test"]
             .get_collection(
                 "items",
-                read_concern=ReadConcern("majority"),
-                write_concern=WriteConcern(w="majority")
+
+                read_concern=ReadConcern(
+                    "majority"
+                ),
+
+                write_concern=WriteConcern(
+                    w="majority"
+                )
             )
         )
 
         # ====================================================
-        # Update collection
+        # UPDATE COLLECTION
         # ====================================================
-        # Uses the tested C1/C2/C3/C4 configuration.
+        #
+        # Uses tested C1/C2/C3/C4 configuration.
+        #
 
         update_collection = get_collection(
             client,
@@ -168,7 +420,7 @@ def run_experiment(
         )
 
         # ====================================================
-        # First READ -> Primary
+        # FIRST READ -> PRIMARY
         # ====================================================
 
         primary_read_collection = get_collection(
@@ -178,7 +430,7 @@ def run_experiment(
         )
 
         # ====================================================
-        # Second READ -> Secondary
+        # SECOND READ -> SECONDARY
         # ====================================================
 
         secondary_read_collection = get_collection(
@@ -188,7 +440,7 @@ def run_experiment(
         )
 
         # ====================================================
-        # Run N trials
+        # RUN N TRIALS
         # ====================================================
 
         for trial_id in range(
@@ -197,6 +449,7 @@ def run_experiment(
         ):
 
             result = run_one_trial(
+                client,
                 setup_collection,
                 update_collection,
                 primary_read_collection,
@@ -206,12 +459,15 @@ def run_experiment(
             )
 
             if result == "PASS":
+
                 pass_count += 1
 
             elif result == "VIOLATION":
+
                 violation_count += 1
 
             else:
+
                 failed_count += 1
 
     finally:
@@ -219,7 +475,7 @@ def run_experiment(
         client.close()
 
     # ========================================================
-    # Statistics
+    # STATISTICS
     # ========================================================
 
     total_trials = num_trials
@@ -228,6 +484,10 @@ def run_experiment(
         pass_count
         + violation_count
     )
+
+    # --------------------------------------------------------
+    # Violation rate
+    # --------------------------------------------------------
 
     if completed_trials > 0:
 
@@ -241,6 +501,10 @@ def run_experiment(
 
         violation_rate = 0.0
 
+    # --------------------------------------------------------
+    # Failure rate
+    # --------------------------------------------------------
+
     failure_rate = (
         failed_count
         / total_trials
@@ -248,7 +512,7 @@ def run_experiment(
     )
 
     # ========================================================
-    # Print results
+    # PRINT RESULTS
     # ========================================================
 
     print(
@@ -257,6 +521,11 @@ def run_experiment(
 
     print(
         f"Configuration:      {config_name}"
+    )
+
+    print(
+        "Session:            "
+        "Causally Consistent"
     )
 
     print(
@@ -318,9 +587,37 @@ if __name__ == "__main__":
 
     config_name = sys.argv[1].upper()
 
-    num_trials = int(
-        sys.argv[2]
-    )
+    if config_name not in {
+        "C1",
+        "C2",
+        "C3",
+        "C4"
+    }:
+
+        print(
+            "Invalid configuration. "
+            "Choose C1, C2, C3, or C4."
+        )
+
+        sys.exit(1)
+
+    try:
+
+        num_trials = int(
+            sys.argv[2]
+        )
+
+        if num_trials <= 0:
+            raise ValueError
+
+    except ValueError:
+
+        print(
+            "num_trials must be "
+            "a positive integer."
+        )
+
+        sys.exit(1)
 
     run_experiment(
         config_name,
