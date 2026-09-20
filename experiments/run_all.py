@@ -1,38 +1,32 @@
 """
-Normal Operation - Run All Experiments
+Run all Client-Centric Consistency experiments under three scenarios.
 
-功能：
-    自动运行四种 Client-Centric Consistency 实验：
+Scenarios:
+    1. Normal operation
+    2. Node failure
+    3. Network partition
 
-        RYW
-        MR
-        MW
-        WFR
+For each scenario:
+    4 consistency models x 4 MongoDB configurations = 16 experiments
 
-    每种实验分别测试四种 MongoDB 配置：
+Total:
+    3 scenarios x 16 experiments = 48 experiments
 
-        C1: local    + w:1
-        C2: majority + w:1
-        C3: local    + majority
-        C4: majority + majority
+Usage:
+    python run_all.py <num_trials>
 
-    总共：
-        4 consistency models × 4 configurations
-        = 16 组实验
+Example:
+    python run_all.py 100
 
-    同时记录：
-        1. MongoDB 官方对该配置的 consistency guarantee
-        2. 实际实验观察结果
-
-输出：
-    1. 在终端打印每组实验结果
-    2. 将所有实验结果保存到：
-
-        results/normal.csv
+Output:
+    results/normal.csv
+    results/node_failure.csv
+    results/network_partition.csv
 """
 
 import csv
 import os
+import subprocess
 import sys
 
 import ryw
@@ -52,7 +46,6 @@ CONFIGS = [
     "C4"
 ]
 
-
 EXPERIMENTS = {
     "RYW": ryw.run_experiment,
     "MR": mr.run_experiment,
@@ -62,18 +55,33 @@ EXPERIMENTS = {
 
 
 # ============================================================
+# Scenario settings
+# ============================================================
+
+SCENARIOS = {
+    "normal": os.path.join(
+        "..",
+        "scripts",
+        "normal.bat"
+    ),
+
+    "node_failure": os.path.join(
+        "..",
+        "scripts",
+        "node_failure.bat"
+    ),
+
+    "network_partition": os.path.join(
+        "..",
+        "scripts",
+        "network_partition.bat"
+    )
+}
+
+
+# ============================================================
 # MongoDB documented predictions
 # ============================================================
-#
-# Predictions under causally consistent client sessions.
-#
-# GUARANTEED:
-#     MongoDB provides the corresponding consistency guarantee.
-#
-# NOT_GUARANTEED:
-#     MongoDB does not guarantee that the consistency model
-#     will hold in all situations.
-#
 
 PREDICTIONS = {
 
@@ -112,38 +120,52 @@ PREDICTIONS = {
 # ============================================================
 
 def get_observed_result(result):
-    """
-    Convert numerical experiment results into a simple
-    observation label.
-
-    VIOLATION_OBSERVED:
-        At least one completed trial violated the
-        consistency model.
-
-    NO_VIOLATION_WITH_FAILURES:
-        No violation was observed, but some trials
-        could not complete.
-
-    NO_VIOLATION_OBSERVED:
-        All completed trials passed and no failures occurred.
-    """
 
     if result["violations"] > 0:
-
         return "VIOLATION_OBSERVED"
 
     if result["failed"] > 0:
-
         return "NO_VIOLATION_WITH_FAILURES"
 
     return "NO_VIOLATION_OBSERVED"
 
 
 # ============================================================
-# Run all experiments
+# Activate scenario
 # ============================================================
 
-def run_all(num_trials):
+def activate_scenario(scenario_name):
+
+    script_path = SCENARIOS[scenario_name]
+
+    print("\n")
+    print("=" * 74)
+    print(f"ACTIVATING SCENARIO: {scenario_name.upper()}")
+    print("=" * 74)
+    print(f"Running: {script_path}")
+    print("=" * 74)
+
+    completed = subprocess.run(
+        script_path,
+        shell=True
+    )
+
+    if completed.returncode != 0:
+        raise RuntimeError(
+            f"Scenario setup failed: {scenario_name}"
+        )
+
+    print(
+        f"\nScenario '{scenario_name}' "
+        f"activated successfully."
+    )
+
+
+# ============================================================
+# Run all 16 experiments for ONE scenario
+# ============================================================
+
+def run_scenario(scenario_name, num_trials):
 
     results = []
 
@@ -154,79 +176,59 @@ def run_all(num_trials):
 
     current_experiment = 0
 
+    print("\n")
+    print("=" * 74)
     print(
-        "\n=========================================="
+        f"{scenario_name.upper()} EXPERIMENTS"
     )
-
-    print(
-        "       NORMAL OPERATION EXPERIMENTS"
-    )
-
-    print(
-        "=========================================="
-    )
+    print("=" * 74)
 
     print(
         f"Trials per experiment: {num_trials}"
     )
 
     print(
-        f"Total experiments:     {total_experiments}"
+        f"Experiments in scenario: {total_experiments}"
     )
 
-    print(
-        "=========================================="
-    )
-
-    # ========================================================
-    # Run RYW / MR / MW / WFR
-    # ========================================================
+    print("=" * 74)
 
     for consistency_name, experiment_function in (
         EXPERIMENTS.items()
     ):
 
-        # ====================================================
-        # Run C1 / C2 / C3 / C4
-        # ====================================================
-
         for config_name in CONFIGS:
 
             current_experiment += 1
 
-            print(
-                "\n##########################################"
-            )
+            print("\n")
+            print("#" * 74)
 
             print(
                 f"[{current_experiment}/{total_experiments}] "
-                f"{consistency_name} - {config_name}"
+                f"{scenario_name} | "
+                f"{consistency_name} | "
+                f"{config_name}"
             )
 
-            print(
-                "##########################################"
-            )
+            print("#" * 74)
 
             try:
-
-                # --------------------------------------------
-                # Run experiment
-                # --------------------------------------------
 
                 result = experiment_function(
                     config_name,
                     num_trials
                 )
 
-                # --------------------------------------------
-                # Add scenario
-                # --------------------------------------------
+                if result is None:
+                    raise RuntimeError(
+                        f"{consistency_name}.run_experiment() "
+                        "returned None. "
+                        "Check that the tester returns "
+                        "its statistics dictionary."
+                    )
 
-                result["scenario"] = "normal"
-
-                # --------------------------------------------
-                # Add MongoDB documented prediction
-                # --------------------------------------------
+                result["scenario"] = scenario_name
 
                 result["predicted_guarantee"] = (
                     PREDICTIONS[
@@ -236,31 +238,20 @@ def run_all(num_trials):
                     ]
                 )
 
-                # --------------------------------------------
-                # Add observed result
-                # --------------------------------------------
-
                 result["observed_result"] = (
                     get_observed_result(
                         result
                     )
                 )
 
-                results.append(
-                    result
-                )
+                results.append(result)
 
             except Exception as e:
 
-                # --------------------------------------------
-                # If an entire experiment crashes,
-                # record it as failed but continue running
-                # the remaining experiments.
-                # --------------------------------------------
-
                 print(
                     f"\nExperiment failed: "
-                    f"{consistency_name} - {config_name}"
+                    f"{consistency_name} - "
+                    f"{config_name}"
                 )
 
                 print(
@@ -269,37 +260,44 @@ def run_all(num_trials):
 
                 results.append(
                     {
-                        "scenario": "normal",
+                        "scenario": scenario_name,
 
-                        "consistency": consistency_name,
+                        "consistency":
+                            consistency_name,
 
-                        "config": config_name,
+                        "config":
+                            config_name,
 
-                        "predicted_guarantee": (
+                        "predicted_guarantee":
                             PREDICTIONS[
                                 consistency_name
                             ][
                                 config_name
-                            ]
-                        ),
+                            ],
 
-                        "observed_result": (
-                            "EXPERIMENT_FAILED"
-                        ),
+                        "observed_result":
+                            "EXPERIMENT_FAILED",
 
-                        "total_trials": num_trials,
+                        "total_trials":
+                            num_trials,
 
-                        "completed_trials": 0,
+                        "completed_trials":
+                            0,
 
-                        "passes": 0,
+                        "passes":
+                            0,
 
-                        "violations": 0,
+                        "violations":
+                            0,
 
-                        "failed": num_trials,
+                        "failed":
+                            num_trials,
 
-                        "violation_rate": 0.0,
+                        "violation_rate":
+                            0.0,
 
-                        "failure_rate": 100.0
+                        "failure_rate":
+                            100.0
                     }
                 )
 
@@ -307,14 +305,13 @@ def run_all(num_trials):
 
 
 # ============================================================
-# Save results to CSV
+# Save ONE scenario to CSV
 # ============================================================
 
-def save_results(results):
-
-    # --------------------------------------------------------
-    # Create results folder automatically
-    # --------------------------------------------------------
+def save_results(
+    scenario_name,
+    results
+):
 
     os.makedirs(
         "results",
@@ -323,12 +320,8 @@ def save_results(results):
 
     output_file = os.path.join(
         "results",
-        "normal.csv"
+        f"{scenario_name}.csv"
     )
-
-    # --------------------------------------------------------
-    # CSV columns
-    # --------------------------------------------------------
 
     fieldnames = [
         "scenario",
@@ -345,10 +338,6 @@ def save_results(results):
         "failure_rate"
     ]
 
-    # --------------------------------------------------------
-    # Write CSV
-    # --------------------------------------------------------
-
     with open(
         output_file,
         "w",
@@ -364,32 +353,29 @@ def save_results(results):
         writer.writeheader()
 
         for result in results:
-
-            writer.writerow(
-                result
-            )
+            writer.writerow(result)
 
     return output_file
 
 
 # ============================================================
-# Print final summary
+# Print scenario summary
 # ============================================================
 
-def print_summary(results):
+def print_summary(
+    scenario_name,
+    results
+):
+
+    print("\n")
+    print("=" * 90)
 
     print(
-        "\n\n"
-        "=========================================================================="
+        f"FINAL SUMMARY - "
+        f"{scenario_name.upper()}"
     )
 
-    print(
-        "                              FINAL SUMMARY"
-    )
-
-    print(
-        "=========================================================================="
-    )
+    print("=" * 90)
 
     print(
         f"{'Model':<8}"
@@ -402,9 +388,7 @@ def print_summary(results):
         f"{'F-Rate':<10}"
     )
 
-    print(
-        "--------------------------------------------------------------------------"
-    )
+    print("-" * 90)
 
     for result in results:
 
@@ -419,20 +403,14 @@ def print_summary(results):
             f"{result['failure_rate']:<10.2f}"
         )
 
-    print(
-        "=========================================================================="
-    )
+    print("=" * 90)
 
 
 # ============================================================
-# Command-line entry point
+# Main
 # ============================================================
 
 if __name__ == "__main__":
-
-    # ========================================================
-    # Check command-line arguments
-    # ========================================================
 
     if len(sys.argv) != 2:
 
@@ -443,10 +421,6 @@ if __name__ == "__main__":
         )
 
         sys.exit(1)
-
-    # ========================================================
-    # Parse number of trials
-    # ========================================================
 
     try:
 
@@ -466,30 +440,142 @@ if __name__ == "__main__":
 
         sys.exit(1)
 
-    # ========================================================
-    # Run all 16 experiments
-    # ========================================================
-
-    results = run_all(
-        num_trials
-    )
 
     # ========================================================
-    # Save results
+    # Run 3 scenarios x 16 experiments = 48 experiments
     # ========================================================
 
-    output_file = save_results(
-        results
-    )
+    print("\n")
+    print("=" * 74)
+    print("FULL EXPERIMENT SUITE")
+    print("=" * 74)
 
-    # ========================================================
-    # Print summary
-    # ========================================================
-
-    print_summary(
-        results
+    print(
+        f"Trials per experiment: {num_trials}"
     )
 
     print(
-        f"\nResults saved to: {output_file}"
+        "Scenarios:             3"
     )
+
+    print(
+        "Experiments/scenario:  16"
+    )
+
+    print(
+        "Total experiments:     48"
+    )
+
+    print(
+        f"Total trials:          "
+        f"{48 * num_trials}"
+    )
+
+    print("=" * 74)
+
+
+    generated_files = []
+
+    try:
+
+        for scenario_name in SCENARIOS:
+
+            # -----------------------------------------------
+            # Change Docker environment
+            # -----------------------------------------------
+
+            activate_scenario(
+                scenario_name
+            )
+
+            # -----------------------------------------------
+            # Run 16 experiments
+            # -----------------------------------------------
+
+            results = run_scenario(
+                scenario_name,
+                num_trials
+            )
+
+            # -----------------------------------------------
+            # Save CSV immediately
+            # -----------------------------------------------
+
+            output_file = save_results(
+                scenario_name,
+                results
+            )
+
+            generated_files.append(
+                output_file
+            )
+
+            # -----------------------------------------------
+            # Print summary
+            # -----------------------------------------------
+
+            print_summary(
+                scenario_name,
+                results
+            )
+
+            print(
+                f"\nResults saved to: "
+                f"{output_file}"
+            )
+
+    finally:
+
+        # ====================================================
+        # Always restore the cluster to NORMAL
+        # ====================================================
+
+        print("\n")
+        print("=" * 74)
+        print("RESTORING CLUSTER TO NORMAL")
+        print("=" * 74)
+
+        try:
+
+            activate_scenario(
+                "normal"
+            )
+
+        except Exception as e:
+
+            print(
+                "WARNING: automatic restoration "
+                "failed."
+            )
+
+            print(
+                f"{type(e).__name__}: {e}"
+            )
+
+
+    # ========================================================
+    # Final output
+    # ========================================================
+
+    print("\n")
+    print("=" * 74)
+    print("ALL EXPERIMENTS FINISHED")
+    print("=" * 74)
+
+    print(
+        f"Total experiment groups: 48"
+    )
+
+    print(
+        f"Total trials: "
+        f"{48 * num_trials}"
+    )
+
+    print("\nGenerated files:")
+
+    for output_file in generated_files:
+        print(
+            f"  {output_file}"
+        )
+
+    print("=" * 74)

@@ -1,5 +1,5 @@
 @echo off
-call scripts\normal.bat
+call "%~dp0normal.bat"
 echo Simulating node failure: stopping mongo3...
 docker stop mongo3
 timeout /t 5 >nul

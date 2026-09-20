@@ -1,5 +1,5 @@
 @echo off
-call scripts\normal.bat
+call "%~dp0normal.bat"
 echo Simulating network partition: isolating mongo3...
 docker network disconnect dsa5208p1_default mongo3
 timeout /t 5 >nul
