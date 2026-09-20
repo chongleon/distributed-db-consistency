@@ -495,6 +495,18 @@ def run_experiment(
         "================================="
     )
 
+    return {
+        "consistency": "RYW",
+        "config": config_name,
+        "total_trials": total_trials,
+        "completed_trials": completed_trials,
+        "passes": pass_count,
+        "violations": violation_count,
+        "failed": failed_count,
+        "violation_rate": violation_rate,
+        "failure_rate": failure_rate
+    }    
+
 
 # ============================================================
 # Command-line entry point
